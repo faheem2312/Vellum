@@ -165,3 +165,24 @@ impl Message {
         w.write_all(&buf[..n])
     }
 }
+
+/// Reads exactly one message from a `Read` by first peeking the tag byte to
+/// know how many more bytes to pull. Phase 2 will replace this with a
+/// proper length-delimited framing + reusable read buffer for efficiency.
+pub fn read_message<R: Read>(r: &mut R) -> io::Result<Message> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+    let body_len: usize = match tag[0] {
+        TAG_NEW_ORDER => 21,
+        TAG_CANCEL => 8,
+        TAG_ACK => 8,
+        TAG_REJECT => 9,
+        TAG_TRADE => 28,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
+    };
+    let mut full = [0u8; 32];
+    full[0] = tag[0];
+    r.read_exact(&mut full[1..1 + body_len])?;
+    let (msg, _) = Message::decode(&full[..1 + body_len])?;
+    Ok(msg)
+}
