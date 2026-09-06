@@ -186,3 +186,41 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Message> {
     let (msg, _) = Message::decode(&full[..1 + body_len])?;
     Ok(msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_new_order() {
+        let msg = Message::NewOrder {
+            order_id: 42,
+            side: Side::Buy,
+            price: 10_050,
+            qty: 100,
+        };
+        let mut buf = [0u8; 32];
+        let n = msg.encode(&mut buf);
+        assert_eq!(n, msg.encoded_len());
+        let (decoded, consumed) = Message::decode(&buf[..n]).unwrap();
+        assert_eq!(consumed, n);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn round_trip_all_variants() {
+        let msgs = vec![
+            Message::NewOrder { order_id: 1, side: Side::Sell, price: 999, qty: 5 },
+            Message::Cancel { order_id: 1 },
+            Message::Ack { order_id: 1 },
+            Message::Reject { order_id: 1, reason: 7 },
+            Message::Trade { resting_order_id: 1, incoming_order_id: 2, price: 999, qty: 5 },
+        ];
+        for m in msgs {
+            let mut buf = [0u8; 32];
+            let n = m.encode(&mut buf);
+            let (decoded, _) = Message::decode(&buf[..n]).unwrap();
+            assert_eq!(decoded, m);
+        }
+    }
+}

@@ -194,3 +194,78 @@ impl Default for OrderBook {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resting_order_when_no_match() {
+        let mut book = OrderBook::new();
+        let trades = book.add_order(1, Side::Buy, 100, 10);
+        assert!(trades.is_empty());
+        assert_eq!(book.best_bid(), Some(100));
+    }
+
+    #[test]
+    fn simple_full_match() {
+        let mut book = OrderBook::new();
+        book.add_order(1, Side::Sell, 100, 10);
+        let trades = book.add_order(2, Side::Buy, 100, 10);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].qty, 10);
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn partial_fill_leaves_remainder_resting() {
+        let mut book = OrderBook::new();
+        book.add_order(1, Side::Sell, 100, 5);
+        let trades = book.add_order(2, Side::Buy, 100, 10);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].qty, 5);
+        // 5 leftover buy qty should now rest on the bid side.
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn price_priority_best_price_matched_first() {
+        let mut book = OrderBook::new();
+        book.add_order(1, Side::Sell, 105, 10);
+        book.add_order(2, Side::Sell, 100, 10); // better (cheaper) ask, added second
+        let trades = book.add_order(3, Side::Buy, 105, 10);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].resting_order_id, 2); // cheaper ask fills first, despite arriving later
+    }
+
+    #[test]
+    fn time_priority_within_same_price() {
+        let mut book = OrderBook::new();
+        book.add_order(1, Side::Sell, 100, 5);
+        book.add_order(2, Side::Sell, 100, 5); // same price, later -> behind in queue
+        let trades = book.add_order(3, Side::Buy, 100, 5);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].resting_order_id, 1); // FIFO: first order in fills first
+    }
+
+    #[test]
+    fn cancel_removes_order_from_book() {
+        let mut book = OrderBook::new();
+        book.add_order(1, Side::Buy, 100, 10);
+        assert!(book.cancel_order(1));
+        assert_eq!(book.best_bid(), None);
+        assert!(!book.cancel_order(1)); // already gone, second cancel should fail
+    }
+
+    #[test]
+    fn no_match_when_prices_dont_cross() {
+        let mut book = OrderBook::new();
+        book.add_order(1, Side::Sell, 105, 10);
+        let trades = book.add_order(2, Side::Buy, 100, 10);
+        assert!(trades.is_empty());
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.best_ask(), Some(105));
+    }
+}
