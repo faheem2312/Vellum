@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 protocol = { path = "../protocol" }
 orderbook = { path = "../orderbook" }
+crossbeam-queue = "0.3"

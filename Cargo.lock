@@ -162,6 +162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -295,6 +304,7 @@ name = "orderbook"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "crossbeam-queue",
  "protocol",
 ]
 
@@ -465,6 +475,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "orderbook",
  "protocol",
 ]

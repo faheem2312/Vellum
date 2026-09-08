@@ -1,65 +1,91 @@
-//! Vellum matching engine server — Phase 2.
+//! Vellum matching engine server — Phase 2b, with server-assigned order IDs.
 //!
-//! Architecture change from Phase 1: instead of an `Arc<Mutex<OrderBook>>`
-//! shared across client threads, a single dedicated "engine thread" owns
-//! the OrderBook exclusively. Client threads never touch it directly —
-//! they send a `Command` over an mpsc channel and wait for an `EngineReply`
-//! back over a per-request reply channel.
+//! Architecture: a single engine thread owns the OrderBook exclusively and
+//! busy-polls a lock-free ring buffer (crossbeam's ArrayQueue) for work.
 //!
-//! Why: a Mutex held across matching logic is a latency bottleneck under
-//! contention. With a single-writer design, there is nothing to contend
-//! over — the engine thread processes commands one at a time, in order,
-//! with zero locking.
+//! Order IDs: clients propose a `client_order_id` for their own tracking,
+//! but this server assigns the authoritative, globally-unique
+//! `server_order_id` used inside the OrderBook — this is required for
+//! correctness once more than one client can be connected at a time.
 //!
 //! Run with: cargo run --release --bin server -- 127.0.0.1:7878
 
+use crossbeam_queue::ArrayQueue;
 use orderbook::{OrderBook, Trade};
 use protocol::{Message, Side};
+use std::hint;
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
-/// A request sent from a client-handling thread to the engine thread.
+const QUEUE_CAPACITY: usize = 4096;
+
 enum Command {
-    NewOrder {
-        order_id: u64,
-        side: Side,
-        price: u64,
-        qty: u32,
-        reply: Sender<EngineReply>,
-    },
-    Cancel {
-        order_id: u64,
-        reply: Sender<EngineReply>,
-    },
+    NewOrder { client_order_id: u64, side: Side, price: u64, qty: u32 },
+    Cancel { server_order_id: u64 },
 }
 
-/// The engine thread's response to a Command, sent back over a
-/// one-shot-style reply channel unique to that request.
 enum EngineReply {
-    OrderResult { order_id: u64, trades: Vec<Trade> },
-    CancelResult { order_id: u64, found: bool },
+    OrderResult { client_order_id: u64, server_order_id: u64, trades: Vec<Trade> },
+    CancelResult { server_order_id: u64, found: bool },
 }
 
-/// The engine thread's main loop: owns the OrderBook, processes commands
-/// one at a time, forever. This is the ONLY place OrderBook is touched.
-fn run_engine(rx: mpsc::Receiver<Command>) {
+struct Request {
+    cmd: Command,
+    reply_slot: Arc<ArrayQueue<EngineReply>>,
+}
+
+/// The engine thread's main loop. Busy-polls the queue; the ONLY place
+/// OrderBook is ever touched. Owns the global order-ID counter too, since
+/// ID assignment must happen in the same serialized place as book access.
+fn run_engine(queue: Arc<ArrayQueue<Request>>, running: Arc<AtomicBool>) {
     let mut book = OrderBook::new();
-    for cmd in rx {
-        match cmd {
-            Command::NewOrder { order_id, side, price, qty, reply } => {
-                let trades = book.add_order(order_id, side, price, qty);
-                let _ = reply.send(EngineReply::OrderResult { order_id, trades });
+    let mut next_server_id: u64 = 1;
+
+    loop {
+        match queue.pop() {
+            Some(req) => {
+                let reply = match req.cmd {
+                    Command::NewOrder { client_order_id, side, price, qty } => {
+                        let server_order_id = next_server_id;
+                        next_server_id += 1;
+                        let trades = book.add_order(server_order_id, side, price, qty);
+                        EngineReply::OrderResult { client_order_id, server_order_id, trades }
+                    }
+                    Command::Cancel { server_order_id } => {
+                        let found = book.cancel_order(server_order_id);
+                        EngineReply::CancelResult { server_order_id, found }
+                    }
+                };
+                let _ = req.reply_slot.push(reply);
             }
-            Command::Cancel { order_id, reply } => {
-                let found = book.cancel_order(order_id);
-                let _ = reply.send(EngineReply::CancelResult { order_id, found });
+            None => {
+                if !running.load(Ordering::Relaxed) && queue.is_empty() {
+                    break;
+                }
+                hint::spin_loop();
             }
         }
     }
 }
 
-fn handle_client(stream: TcpStream, cmd_tx: Sender<Command>) {
+fn submit(queue: &ArrayQueue<Request>, cmd: Command) -> EngineReply {
+    let reply_slot: Arc<ArrayQueue<EngineReply>> = Arc::new(ArrayQueue::new(1));
+    let mut req = Request { cmd, reply_slot: Arc::clone(&reply_slot) };
+    while let Err(returned) = queue.push(req) {
+        req = returned;
+        hint::spin_loop();
+    }
+    loop {
+        if let Some(reply) = reply_slot.pop() {
+            return reply;
+        }
+        hint::spin_loop();
+    }
+}
+
+fn handle_client(stream: TcpStream, queue: Arc<ArrayQueue<Request>>) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -79,20 +105,14 @@ fn handle_client(stream: TcpStream, cmd_tx: Sender<Command>) {
         };
 
         match msg {
-            Message::NewOrder { order_id, side, price, qty } => {
-                let (reply_tx, reply_rx) = mpsc::channel();
-                if cmd_tx
-                    .send(Command::NewOrder { order_id, side, price, qty, reply: reply_tx })
-                    .is_err()
-                {
-                    break; // engine thread gone, nothing more we can do
-                }
-
-                let Ok(EngineReply::OrderResult { order_id, trades }) = reply_rx.recv() else {
-                    break;
+            Message::NewOrder { client_order_id, side, price, qty } => {
+                let reply = submit(&queue, Command::NewOrder { client_order_id, side, price, qty });
+                let EngineReply::OrderResult { client_order_id, server_order_id, trades } = reply
+                else {
+                    unreachable!("engine always replies with OrderResult to NewOrder")
                 };
 
-                if (Message::Ack { order_id }).write_to(&mut writer).is_err() {
+                if (Message::Ack { client_order_id, server_order_id }).write_to(&mut writer).is_err() {
                     break;
                 }
                 for t in &trades {
@@ -107,26 +127,22 @@ fn handle_client(stream: TcpStream, cmd_tx: Sender<Command>) {
                     }
                 }
                 println!(
-                    "[server] order {order_id} ({side:?} {qty}@{price}) -> {} trade(s)",
+                    "[server] order client_id={client_order_id} -> server_id={server_order_id} ({side:?} {qty}@{price}) -> {} trade(s)",
                     trades.len()
                 );
             }
-            Message::Cancel { order_id } => {
-                let (reply_tx, reply_rx) = mpsc::channel();
-                if cmd_tx.send(Command::Cancel { order_id, reply: reply_tx }).is_err() {
-                    break;
-                }
-
-                let Ok(EngineReply::CancelResult { order_id, found }) = reply_rx.recv() else {
-                    break;
+            Message::Cancel { server_order_id } => {
+                let reply = submit(&queue, Command::Cancel { server_order_id });
+                let EngineReply::CancelResult { server_order_id, found } = reply else {
+                    unreachable!("engine always replies with CancelResult to Cancel")
                 };
 
-                let reply = if found {
-                    Message::Ack { order_id }
+                let reply_msg = if found {
+                    Message::Ack { client_order_id: server_order_id, server_order_id }
                 } else {
-                    Message::Reject { order_id, reason: 1 }
+                    Message::Reject { server_order_id, reason: 1 }
                 };
-                if reply.write_to(&mut writer).is_err() {
+                if reply_msg.write_to(&mut writer).is_err() {
                     break;
                 }
             }
@@ -145,16 +161,18 @@ fn main() {
     let listener = TcpListener::bind(&addr).expect("failed to bind");
     println!("[server] listening on {addr}");
 
-    // The engine thread owns the OrderBook. cmd_tx is cloned into every
-    // client thread; mpsc::Sender is cheap to clone and thread-safe.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
-    thread::spawn(move || run_engine(cmd_rx));
+    let queue: Arc<ArrayQueue<Request>> = Arc::new(ArrayQueue::new(QUEUE_CAPACITY));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let engine_queue = Arc::clone(&queue);
+    let engine_running = Arc::clone(&running);
+    thread::spawn(move || run_engine(engine_queue, engine_running));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let cmd_tx = cmd_tx.clone();
-                thread::spawn(move || handle_client(stream, cmd_tx));
+                let queue = Arc::clone(&queue);
+                thread::spawn(move || handle_client(stream, queue));
             }
             Err(e) => eprintln!("[server] connection failed: {e}"),
         }

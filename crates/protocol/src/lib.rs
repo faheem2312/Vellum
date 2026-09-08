@@ -5,9 +5,11 @@
 //! - Every message starts with a 1-byte tag so the reader knows how to parse it.
 //! - No heap allocation required to encode/decode a single message.
 //!
-//! Real HFT protocols look almost exactly like this in spirit: dense
-//! fixed-width binary framing instead of a text protocol like FIX, because
-//! parsing text is slow and allocates memory.
+//! Order ID model: clients propose a `client_order_id` for their own local
+//! tracking, but the SERVER assigns the authoritative `server_order_id`
+//! used inside the matching engine — this guarantees uniqueness across
+//! multiple concurrent clients, which client-generated IDs alone cannot.
+//! Cancel and all Trade messages always refer to server-assigned IDs.
 
 use std::io::{self, Read, Write};
 
@@ -29,20 +31,28 @@ impl Side {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// Client -> Server: submit a new order.
+    /// Client -> Server: submit a new order. `client_order_id` is the
+    /// client's own local tracking ID, NOT guaranteed unique across
+    /// multiple clients — the server will assign the real one.
     NewOrder {
-        order_id: u64,
+        client_order_id: u64,
         side: Side,
         price: u64, // price in integer ticks (e.g. cents) — never use floats for money
         qty: u32,
     },
-    /// Client -> Server: cancel a previously submitted order.
-    Cancel { order_id: u64 },
-    /// Server -> Client: order accepted into the book.
-    Ack { order_id: u64 },
-    /// Server -> Client: order rejected (e.g. unknown id on cancel).
-    Reject { order_id: u64, reason: u8 },
-    /// Server -> Client: a trade occurred.
+    /// Client -> Server: cancel a previously submitted order, referenced
+    /// by its SERVER-assigned ID (from the Ack you received for it).
+    Cancel { server_order_id: u64 },
+    /// Server -> Client: order accepted into the book. Echoes the
+    /// client's original ID and provides the authoritative server ID —
+    /// the client must use `server_order_id` for any future Cancel.
+    Ack {
+        client_order_id: u64,
+        server_order_id: u64,
+    },
+    /// Server -> Client: request rejected (e.g. unknown order id on cancel).
+    Reject { server_order_id: u64, reason: u8 },
+    /// Server -> Client: a trade occurred. Both IDs are server-assigned.
     Trade {
         resting_order_id: u64,
         incoming_order_id: u64,
@@ -62,27 +72,28 @@ impl Message {
     /// Never allocates on the heap.
     pub fn encode(&self, buf: &mut [u8]) -> usize {
         match self {
-            Message::NewOrder { order_id, side, price, qty } => {
+            Message::NewOrder { client_order_id, side, price, qty } => {
                 buf[0] = TAG_NEW_ORDER;
-                buf[1..9].copy_from_slice(&order_id.to_le_bytes());
+                buf[1..9].copy_from_slice(&client_order_id.to_le_bytes());
                 buf[9] = *side as u8;
                 buf[10..18].copy_from_slice(&price.to_le_bytes());
                 buf[18..22].copy_from_slice(&qty.to_le_bytes());
                 22
             }
-            Message::Cancel { order_id } => {
+            Message::Cancel { server_order_id } => {
                 buf[0] = TAG_CANCEL;
-                buf[1..9].copy_from_slice(&order_id.to_le_bytes());
+                buf[1..9].copy_from_slice(&server_order_id.to_le_bytes());
                 9
             }
-            Message::Ack { order_id } => {
+            Message::Ack { client_order_id, server_order_id } => {
                 buf[0] = TAG_ACK;
-                buf[1..9].copy_from_slice(&order_id.to_le_bytes());
-                9
+                buf[1..9].copy_from_slice(&client_order_id.to_le_bytes());
+                buf[9..17].copy_from_slice(&server_order_id.to_le_bytes());
+                17
             }
-            Message::Reject { order_id, reason } => {
+            Message::Reject { server_order_id, reason } => {
                 buf[0] = TAG_REJECT;
-                buf[1..9].copy_from_slice(&order_id.to_le_bytes());
+                buf[1..9].copy_from_slice(&server_order_id.to_le_bytes());
                 buf[9] = *reason;
                 10
             }
@@ -102,7 +113,7 @@ impl Message {
         match self {
             Message::NewOrder { .. } => 22,
             Message::Cancel { .. } => 9,
-            Message::Ack { .. } => 9,
+            Message::Ack { .. } => 17,
             Message::Reject { .. } => 10,
             Message::Trade { .. } => 29,
         }
@@ -124,27 +135,28 @@ impl Message {
         match tag {
             TAG_NEW_ORDER => {
                 need(22)?;
-                let order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                let client_order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
                 let side = Side::from_u8(buf[9])?;
                 let price = u64::from_le_bytes(buf[10..18].try_into().unwrap());
                 let qty = u32::from_le_bytes(buf[18..22].try_into().unwrap());
-                Ok((Message::NewOrder { order_id, side, price, qty }, 22))
+                Ok((Message::NewOrder { client_order_id, side, price, qty }, 22))
             }
             TAG_CANCEL => {
                 need(9)?;
-                let order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-                Ok((Message::Cancel { order_id }, 9))
+                let server_order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                Ok((Message::Cancel { server_order_id }, 9))
             }
             TAG_ACK => {
-                need(9)?;
-                let order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-                Ok((Message::Ack { order_id }, 9))
+                need(17)?;
+                let client_order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                let server_order_id = u64::from_le_bytes(buf[9..17].try_into().unwrap());
+                Ok((Message::Ack { client_order_id, server_order_id }, 17))
             }
             TAG_REJECT => {
                 need(10)?;
-                let order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                let server_order_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
                 let reason = buf[9];
-                Ok((Message::Reject { order_id, reason }, 10))
+                Ok((Message::Reject { server_order_id, reason }, 10))
             }
             TAG_TRADE => {
                 need(29)?;
@@ -152,7 +164,10 @@ impl Message {
                 let incoming_order_id = u64::from_le_bytes(buf[9..17].try_into().unwrap());
                 let price = u64::from_le_bytes(buf[17..25].try_into().unwrap());
                 let qty = u32::from_le_bytes(buf[25..29].try_into().unwrap());
-                Ok((Message::Trade { resting_order_id, incoming_order_id, price, qty }, 29))
+                Ok((
+                    Message::Trade { resting_order_id, incoming_order_id, price, qty },
+                    29,
+                ))
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
         }
@@ -167,15 +182,14 @@ impl Message {
 }
 
 /// Reads exactly one message from a `Read` by first peeking the tag byte to
-/// know how many more bytes to pull. Phase 2 will replace this with a
-/// proper length-delimited framing + reusable read buffer for efficiency.
+/// know how many more bytes to pull.
 pub fn read_message<R: Read>(r: &mut R) -> io::Result<Message> {
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag)?;
     let body_len: usize = match tag[0] {
         TAG_NEW_ORDER => 21,
         TAG_CANCEL => 8,
-        TAG_ACK => 8,
+        TAG_ACK => 16,
         TAG_REJECT => 9,
         TAG_TRADE => 28,
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
@@ -194,7 +208,7 @@ mod tests {
     #[test]
     fn round_trip_new_order() {
         let msg = Message::NewOrder {
-            order_id: 42,
+            client_order_id: 42,
             side: Side::Buy,
             price: 10_050,
             qty: 100,
@@ -210,10 +224,10 @@ mod tests {
     #[test]
     fn round_trip_all_variants() {
         let msgs = vec![
-            Message::NewOrder { order_id: 1, side: Side::Sell, price: 999, qty: 5 },
-            Message::Cancel { order_id: 1 },
-            Message::Ack { order_id: 1 },
-            Message::Reject { order_id: 1, reason: 7 },
+            Message::NewOrder { client_order_id: 1, side: Side::Sell, price: 999, qty: 5 },
+            Message::Cancel { server_order_id: 1 },
+            Message::Ack { client_order_id: 1, server_order_id: 100 },
+            Message::Reject { server_order_id: 1, reason: 7 },
             Message::Trade { resting_order_id: 1, incoming_order_id: 2, price: 999, qty: 5 },
         ];
         for m in msgs {

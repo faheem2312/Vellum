@@ -8,6 +8,7 @@ protocol = { path = "../protocol" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+crossbeam-queue = "0.3"
 
 [[bench]]
 name = "matching"
