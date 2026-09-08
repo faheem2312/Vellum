@@ -1,25 +1,65 @@
-//! Vellum matching engine server.
+//! Vellum matching engine server — Phase 2.
 //!
-//! Phase 1 architecture (deliberately simple, correctness-first):
-//! - One shared `OrderBook` behind a `Mutex`.
-//! - One OS thread per client connection.
-//! - Each incoming message is applied to the book while holding the lock,
-//!   and any resulting Ack/Trade messages are written back to the
-//!   connection that sent the order.
+//! Architecture change from Phase 1: instead of an `Arc<Mutex<OrderBook>>`
+//! shared across client threads, a single dedicated "engine thread" owns
+//! the OrderBook exclusively. Client threads never touch it directly —
+//! they send a `Command` over an mpsc channel and wait for an `EngineReply`
+//! back over a per-request reply channel.
 //!
-//! This is NOT how a real low-latency matching engine is built — a mutex
-//! held across matching logic is a latency bottleneck. That's exactly what
-//! Phase 2 will fix: replacing this with a single-writer thread + channel.
+//! Why: a Mutex held across matching logic is a latency bottleneck under
+//! contention. With a single-writer design, there is nothing to contend
+//! over — the engine thread processes commands one at a time, in order,
+//! with zero locking.
 //!
 //! Run with: cargo run --release --bin server -- 127.0.0.1:7878
 
-use orderbook::OrderBook;
-use protocol::Message;
+use orderbook::{OrderBook, Trade};
+use protocol::{Message, Side};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 
-fn handle_client(stream: TcpStream, book: Arc<Mutex<OrderBook>>) {
+/// A request sent from a client-handling thread to the engine thread.
+enum Command {
+    NewOrder {
+        order_id: u64,
+        side: Side,
+        price: u64,
+        qty: u32,
+        reply: Sender<EngineReply>,
+    },
+    Cancel {
+        order_id: u64,
+        reply: Sender<EngineReply>,
+    },
+}
+
+/// The engine thread's response to a Command, sent back over a
+/// one-shot-style reply channel unique to that request.
+enum EngineReply {
+    OrderResult { order_id: u64, trades: Vec<Trade> },
+    CancelResult { order_id: u64, found: bool },
+}
+
+/// The engine thread's main loop: owns the OrderBook, processes commands
+/// one at a time, forever. This is the ONLY place OrderBook is touched.
+fn run_engine(rx: mpsc::Receiver<Command>) {
+    let mut book = OrderBook::new();
+    for cmd in rx {
+        match cmd {
+            Command::NewOrder { order_id, side, price, qty, reply } => {
+                let trades = book.add_order(order_id, side, price, qty);
+                let _ = reply.send(EngineReply::OrderResult { order_id, trades });
+            }
+            Command::Cancel { order_id, reply } => {
+                let found = book.cancel_order(order_id);
+                let _ = reply.send(EngineReply::CancelResult { order_id, found });
+            }
+        }
+    }
+}
+
+fn handle_client(stream: TcpStream, cmd_tx: Sender<Command>) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -40,9 +80,16 @@ fn handle_client(stream: TcpStream, book: Arc<Mutex<OrderBook>>) {
 
         match msg {
             Message::NewOrder { order_id, side, price, qty } => {
-                let trades = {
-                    let mut book = book.lock().expect("book lock poisoned");
-                    book.add_order(order_id, side, price, qty)
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if cmd_tx
+                    .send(Command::NewOrder { order_id, side, price, qty, reply: reply_tx })
+                    .is_err()
+                {
+                    break; // engine thread gone, nothing more we can do
+                }
+
+                let Ok(EngineReply::OrderResult { order_id, trades }) = reply_rx.recv() else {
+                    break;
                 };
 
                 if (Message::Ack { order_id }).write_to(&mut writer).is_err() {
@@ -65,10 +112,15 @@ fn handle_client(stream: TcpStream, book: Arc<Mutex<OrderBook>>) {
                 );
             }
             Message::Cancel { order_id } => {
-                let found = {
-                    let mut book = book.lock().expect("book lock poisoned");
-                    book.cancel_order(order_id)
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if cmd_tx.send(Command::Cancel { order_id, reply: reply_tx }).is_err() {
+                    break;
+                }
+
+                let Ok(EngineReply::CancelResult { order_id, found }) = reply_rx.recv() else {
+                    break;
                 };
+
                 let reply = if found {
                     Message::Ack { order_id }
                 } else {
@@ -93,13 +145,16 @@ fn main() {
     let listener = TcpListener::bind(&addr).expect("failed to bind");
     println!("[server] listening on {addr}");
 
-    let book = Arc::new(Mutex::new(OrderBook::new()));
+    // The engine thread owns the OrderBook. cmd_tx is cloned into every
+    // client thread; mpsc::Sender is cheap to clone and thread-safe.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+    thread::spawn(move || run_engine(cmd_rx));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let book = Arc::clone(&book);
-                thread::spawn(move || handle_client(stream, book));
+                let cmd_tx = cmd_tx.clone();
+                thread::spawn(move || handle_client(stream, cmd_tx));
             }
             Err(e) => eprintln!("[server] connection failed: {e}"),
         }
